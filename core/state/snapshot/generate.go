@@ -157,13 +157,15 @@ func generateSnapshot(diskdb ethdb.KeyValueStore, triedb *trie.Database, cache i
 		log.Crit("Failed to write initialized state marker", "err", err)
 	}
 	base := &diskLayer{
-		diskdb:     diskdb,
-		triedb:     triedb,
-		root:       root,
-		cache:      fastcache.New(cache * 1024 * 1024),
-		genMarker:  genMarker,
-		genPending: make(chan struct{}),
-		genAbort:   make(chan chan *generatorStats),
+		diskdb:         diskdb,
+		triedb:         triedb,
+		root:           root,
+		cache:          fastcache.New(cache * 1024 * 1024),
+		pending:        map[common.Hash][]byte{},
+		pendingStorage: map[common.Hash]map[common.Hash][]byte{},
+		genMarker:      genMarker,
+		genPending:     make(chan struct{}),
+		genAbort:       make(chan chan *generatorStats),
 	}
 	go base.generate(stats)
 	log.Debug("Start snapshot generation", "root", root)

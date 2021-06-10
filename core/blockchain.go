@@ -1007,6 +1007,7 @@ func (bc *BlockChain) Stop() {
 	var snapBase common.Hash
 	if bc.snaps != nil {
 		var err error
+
 		if snapBase, err = bc.snaps.Journal(bc.CurrentBlock().Root()); err != nil {
 			log.Error("Failed to journal state snapshot", "err", err)
 		}

@@ -210,6 +210,7 @@ func (s *stateObject) GetCommittedState(db Database, key common.Hash) common.Has
 		err   error
 		meter *time.Duration
 	)
+	// ZZZZZ: time.now
 	readStart := time.Now()
 	if metrics.EnabledExpensive {
 		// If the snap is 'under construction', the first lookup may fail. If that

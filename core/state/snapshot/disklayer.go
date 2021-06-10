@@ -33,6 +33,8 @@ type diskLayer struct {
 	diskdb ethdb.KeyValueStore // Key-value store containing the base snapshot
 	triedb *trie.Database      // Trie node cache for reconstruction purposes
 	cache  *fastcache.Cache    // Cache to avoid hitting the disk for direct access
+	pending map[common.Hash][]byte // Pending entries that need to be flushed to disk, at the end of an entire block
+	pendingStorage map[common.Hash]map[common.Hash][]byte
 
 	root  common.Hash // Root hash of the base snapshot
 	stale bool        // Signals that the layer became stale (state progressed)
@@ -100,7 +102,7 @@ func (dl *diskLayer) AccountRLP(hash common.Hash) ([]byte, error) {
 	snapshotDirtyAccountMissMeter.Mark(1)
 
 	// Try to retrieve the account from the memory cache
-	if blob, found := dl.cache.HasGet(nil, hash[:]); found {
+	if blob, found := dl.getAccountFromCache(hash); found {
 		snapshotCleanAccountHitMeter.Mark(1)
 		snapshotCleanAccountReadMeter.Mark(int64(len(blob)))
 		return blob, nil
@@ -140,7 +142,7 @@ func (dl *diskLayer) Storage(accountHash, storageHash common.Hash) ([]byte, erro
 	snapshotDirtyStorageMissMeter.Mark(1)
 
 	// Try to retrieve the storage slot from the memory cache
-	if blob, found := dl.cache.HasGet(nil, key); found {
+	if blob, found := dl.getStorageFromCache(accountHash, storageHash); found {
 		snapshotCleanStorageHitMeter.Mark(1)
 		snapshotCleanStorageReadMeter.Mark(int64(len(blob)))
 		return blob, nil
@@ -163,4 +165,30 @@ func (dl *diskLayer) Storage(accountHash, storageHash common.Hash) ([]byte, erro
 // copying everything.
 func (dl *diskLayer) Update(blockHash common.Hash, destructs map[common.Hash]struct{}, accounts map[common.Hash][]byte, storage map[common.Hash]map[common.Hash][]byte) *diffLayer {
 	return newDiffLayer(dl, blockHash, destructs, accounts, storage)
+}
+
+func (dl *diskLayer) getAccountFromCache(hash common.Hash) ([]byte, bool) {
+	if blob, found := dl.pending[hash]; found {
+		return blob, true
+	}
+
+	if blob, found := dl.cache.HasGet(nil, hash[:]); found {
+		return blob, true
+	}
+
+	return nil, false
+}
+
+func (dl *diskLayer) getStorageFromCache(accountHash common.Hash, storageHash common.Hash) ([]byte, bool) {
+	if storage, accFound := dl.pendingStorage[accountHash]; accFound {
+		if blob, storageFound := storage[storageHash]; storageFound {
+			return blob, true
+		}
+	}
+
+	if blob, found := dl.cache.HasGet(nil, append(accountHash[:], storageHash[:]...)); found {
+		return blob, true
+	}
+
+	return nil, false
 }

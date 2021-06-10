@@ -443,6 +443,7 @@ func (t *Tree) Cap(root common.Hash, layers int) error {
 // survival is only known *after* capping, we need to omit it from the count if
 // we want to ensure that *at least* the requested number of diff layers remain.
 func (t *Tree) cap(diff *diffLayer, layers int) *diskLayer {
+	log.Info("cap", "layers", layers)
 	// Dive until we run out of layers or reach the persistent database
 	for i := 0; i < layers-1; i++ {
 		// If we still have diff layers below, continue down
@@ -457,11 +458,13 @@ func (t *Tree) cap(diff *diffLayer, layers int) *diskLayer {
 	// the memory limit is not yet exceeded.
 	switch parent := diff.parent.(type) {
 	case *diskLayer:
+		log.Info("cap disklayer", "layers", layers)
 		return nil
 
 	case *diffLayer:
 		// Flatten the parent into the grandparent. The flattening internally obtains a
 		// write lock on grandparent.
+		log.Info("cap difflayer", "layers", layers)
 		flattened := parent.flatten().(*diffLayer)
 		t.layers[flattened.root] = flattened
 
@@ -475,6 +478,7 @@ func (t *Tree) cap(diff *diffLayer, layers int) *diskLayer {
 			// will move fron underneath the generator so we **must** merge all the
 			// partial data down into the snapshot and restart the generation.
 			if flattened.parent.(*diskLayer).genAbort == nil {
+				log.Info("cap genabort == nil")
 				return nil
 			}
 		}
@@ -499,9 +503,9 @@ func (t *Tree) cap(diff *diffLayer, layers int) *diskLayer {
 // The disk layer persistence should be operated in an atomic way. All updates should
 // be discarded if the whole transition if not finished.
 func diffToDisk(bottom *diffLayer) *diskLayer {
+	log.Info("prepare diffToDisk", "diff", bottom.root)
 	var (
 		base  = bottom.parent.(*diskLayer)
-		batch = base.diskdb.NewBatch()
 		stats *generatorStats
 	)
 	// If the disk layer is running a snapshot generator, abort it
@@ -510,8 +514,6 @@ func diffToDisk(bottom *diffLayer) *diskLayer {
 		base.genAbort <- abort
 		stats = <-abort
 	}
-	// Put the deletion in the batch writer, flush all updates in the final step.
-	rawdb.DeleteSnapshotRoot(batch)
 
 	// Mark the original base as stale as we're going to create a new wrapper
 	base.lock.Lock()
@@ -521,35 +523,23 @@ func diffToDisk(bottom *diffLayer) *diskLayer {
 	base.stale = true
 	base.lock.Unlock()
 
+	res := &diskLayer{
+		root:           bottom.root,
+		cache:          base.cache,
+		pending:        base.pending,
+		pendingStorage: base.pendingStorage,
+		diskdb:         base.diskdb,
+		triedb:         base.triedb,
+		genMarker:      base.genMarker,
+		genPending:     base.genPending,
+	}
 	// Destroy all the destructed accounts from the database
 	for hash := range bottom.destructSet {
 		// Skip any account not covered yet by the snapshot
 		if base.genMarker != nil && bytes.Compare(hash[:], base.genMarker) > 0 {
 			continue
 		}
-		// Remove all storage slots
-		rawdb.DeleteAccountSnapshot(batch, hash)
-		base.cache.Set(hash[:], nil)
-
-		it := rawdb.IterateStorageSnapshots(base.diskdb, hash)
-		for it.Next() {
-			if key := it.Key(); len(key) == 65 { // TODO(karalabe): Yuck, we should move this into the iterator
-				batch.Delete(key)
-				base.cache.Del(key[1:])
-				snapshotFlushStorageItemMeter.Mark(1)
-
-				// Ensure we don't delete too much data blindly (contract can be
-				// huge). It's ok to flush, the root will go missing in case of a
-				// crash and we'll detect and regenerate the snapshot.
-				if batch.ValueSize() > ethdb.IdealBatchSize {
-					if err := batch.Write(); err != nil {
-						log.Crit("Failed to write storage deletions", "err", err)
-					}
-					batch.Reset()
-				}
-			}
-		}
-		it.Release()
+		res.pending[hash] = nil
 	}
 	// Push all updated accounts into the database
 	for hash, data := range bottom.accountData {
@@ -557,23 +547,7 @@ func diffToDisk(bottom *diffLayer) *diskLayer {
 		if base.genMarker != nil && bytes.Compare(hash[:], base.genMarker) > 0 {
 			continue
 		}
-		// Push the account to disk
-		rawdb.WriteAccountSnapshot(batch, hash, data)
-		base.cache.Set(hash[:], data)
-		snapshotCleanAccountWriteMeter.Mark(int64(len(data)))
-
-		snapshotFlushAccountItemMeter.Mark(1)
-		snapshotFlushAccountSizeMeter.Mark(int64(len(data)))
-
-		// Ensure we don't write too much data blindly. It's ok to flush, the
-		// root will go missing in case of a crash and we'll detect and regen
-		// the snapshot.
-		if batch.ValueSize() > ethdb.IdealBatchSize {
-			if err := batch.Write(); err != nil {
-				log.Crit("Failed to write storage deletions", "err", err)
-			}
-			batch.Reset()
-		}
+		res.pending[hash] = data
 	}
 	// Push all the storage slots into the database
 	for accountHash, storage := range bottom.storageData {
@@ -589,6 +563,96 @@ func diffToDisk(bottom *diffLayer) *diskLayer {
 			if midAccount && bytes.Compare(storageHash[:], base.genMarker[common.HashLength:]) > 0 {
 				continue
 			}
+			if _, found := res.pendingStorage[accountHash]; !found {
+				res.pendingStorage[accountHash] = make(map[common.Hash][]byte)
+			}
+			res.pendingStorage[accountHash][storageHash] = data
+		}
+	}
+
+	if needFlushPending(base) {
+		writePendingToDisk(bottom.root, base, stats)
+		res.pending = map[common.Hash][]byte{}
+		res.pendingStorage = map[common.Hash]map[common.Hash][]byte{}
+	}
+
+	// If snapshot generation hasn't finished yet, port over all the starts and
+	// continue where the previous round left off.
+	//
+	// Note, the `base.genAbort` comparison is not used normally, it's checked
+	// to allow the tests to play with the marker without triggering this path.
+	if base.genMarker != nil && base.genAbort != nil {
+		res.genMarker = base.genMarker
+		res.genAbort = make(chan chan *generatorStats)
+		go res.generate(stats)
+	}
+	return res
+}
+
+func needFlushPending(base *diskLayer) bool {
+	log.Info("diffToDisk stats", "newRoot", base.root, "pending", len(base.pending), "pendingStorage", len(base.pendingStorage))
+	if len(base.pending) >= 10000 || len(base.pendingStorage) >= 2000 {
+		return true
+	}
+
+	return false
+}
+
+func writePendingToDisk(newRoot common.Hash, base *diskLayer, stats *generatorStats) {
+	log.Info("writePendingToDisk", "newRoot", newRoot, "pending", len(base.pending), "pendingStorage", len(base.pendingStorage))
+	var batch = base.diskdb.NewBatch()
+
+	// Put the deletion in the batch writer, flush all updates in the final step.
+	rawdb.DeleteSnapshotRoot(batch)
+	for hash, data := range base.pending {
+		if data == nil {
+			// Remove all storage slots
+			rawdb.DeleteAccountSnapshot(batch, hash)
+			base.cache.Set(hash[:], nil)
+
+			it := rawdb.IterateStorageSnapshots(base.diskdb, hash)
+			for it.Next() {
+				if key := it.Key(); len(key) == 65 { // TODO(karalabe): Yuck, we should move this into the iterator
+					batch.Delete(key)
+					base.cache.Del(key[1:])
+					snapshotFlushStorageItemMeter.Mark(1)
+
+					// Ensure we don't delete too much data blindly (contract can be
+					// huge). It's ok to flush, the root will go missing in case of a
+					// crash and we'll detect and regenerate the snapshot.
+					if batch.ValueSize() > ethdb.IdealBatchSize {
+						if err := batch.Write(); err != nil {
+							log.Crit("Failed to write storage deletions", "err", err)
+						}
+						batch.Reset()
+					}
+				}
+			}
+			it.Release()
+		} else {
+			// Push the account to disk
+			rawdb.WriteAccountSnapshot(batch, hash, data)
+			base.cache.Set(hash[:], data)
+			snapshotCleanAccountWriteMeter.Mark(int64(len(data)))
+
+			snapshotFlushAccountItemMeter.Mark(1)
+			snapshotFlushAccountSizeMeter.Mark(int64(len(data)))
+
+			// Ensure we don't write too much data blindly. It's ok to flush, the
+			// root will go missing in case of a crash and we'll detect and regen
+			// the snapshot.
+			if batch.ValueSize() > ethdb.IdealBatchSize {
+				if err := batch.Write(); err != nil {
+					log.Crit("Failed to write storage deletions", "err", err)
+				}
+				batch.Reset()
+			}
+		}
+
+	}
+
+	for accountHash, storage := range base.pendingStorage {
+		for storageHash, data := range storage {
 			if len(data) > 0 {
 				rawdb.WriteStorageSnapshot(batch, accountHash, storageHash, data)
 				base.cache.Set(append(accountHash[:], storageHash[:]...), data)
@@ -601,8 +665,9 @@ func diffToDisk(bottom *diffLayer) *diskLayer {
 			snapshotFlushStorageSizeMeter.Mark(int64(len(data)))
 		}
 	}
+
 	// Update the snapshot block marker and write any remainder data
-	rawdb.WriteSnapshotRoot(batch, bottom.root)
+	rawdb.WriteSnapshotRoot(batch, newRoot)
 
 	// Write out the generator progress marker and report
 	journalProgress(batch, base.genMarker, stats)
@@ -612,26 +677,7 @@ func diffToDisk(bottom *diffLayer) *diskLayer {
 	if err := batch.Write(); err != nil {
 		log.Crit("Failed to write leftover snapshot", "err", err)
 	}
-	log.Debug("Journalled disk layer", "root", bottom.root, "complete", base.genMarker == nil)
-	res := &diskLayer{
-		root:       bottom.root,
-		cache:      base.cache,
-		diskdb:     base.diskdb,
-		triedb:     base.triedb,
-		genMarker:  base.genMarker,
-		genPending: base.genPending,
-	}
-	// If snapshot generation hasn't finished yet, port over all the starts and
-	// continue where the previous round left off.
-	//
-	// Note, the `base.genAbort` comparison is not used normally, it's checked
-	// to allow the tests to play with the marker without triggering this path.
-	if base.genMarker != nil && base.genAbort != nil {
-		res.genMarker = base.genMarker
-		res.genAbort = make(chan chan *generatorStats)
-		go res.generate(stats)
-	}
-	return res
+	log.Debug("Journalled disk layer", "root", newRoot, "complete", base.genMarker == nil)
 }
 
 // Journal commits an entire diff hierarchy to disk into a single journal entry.

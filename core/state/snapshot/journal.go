@@ -139,10 +139,12 @@ func loadSnapshot(diskdb ethdb.KeyValueStore, triedb *trie.Database, cache int, 
 		return nil, false, errors.New("missing or corrupted snapshot")
 	}
 	base := &diskLayer{
-		diskdb: diskdb,
-		triedb: triedb,
-		cache:  fastcache.New(cache * 1024 * 1024),
-		root:   baseRoot,
+		diskdb:         diskdb,
+		triedb:         triedb,
+		cache:          fastcache.New(cache * 1024 * 1024),
+		pending:        map[common.Hash][]byte{},
+		pendingStorage: map[common.Hash]map[common.Hash][]byte{},
+		root:           baseRoot,
 	}
 	snapshot, generator, err := loadAndParseJournal(diskdb, base)
 	if err != nil {
@@ -266,8 +268,10 @@ func (dl *diskLayer) Journal(buffer *bytes.Buffer) (common.Hash, error) {
 	if dl.stale {
 		return common.Hash{}, ErrSnapshotStale
 	}
+
+	writePendingToDisk(dl.root, dl, stats)
 	// Ensure the generator stats is written even if none was ran this cycle
-	journalProgress(dl.diskdb, dl.genMarker, stats)
+	// journalProgress(dl.diskdb, dl.genMarker, stats)
 
 	log.Debug("Journalled disk layer", "root", dl.root)
 	return dl.root, nil
